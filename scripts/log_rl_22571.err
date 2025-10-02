@@ -1,7 +1,0 @@
-
-CondaError: Run 'conda init' before 'conda activate'
-
-Traceback (most recent call last):
-  File "/NAS2/sophia435256/fql/main.py", line 8, in <module>
-    import jax
-ModuleNotFoundError: No module named 'jax'
