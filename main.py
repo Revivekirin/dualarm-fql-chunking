@@ -43,6 +43,8 @@ flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
 
+flags.DEFINE_string("aloha_task", "sim_insertion", "aloha task")
+
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
 
@@ -59,11 +61,11 @@ def main(_):
 
     # Make environment and datasets.
     config = FLAGS.agent
-    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
-    if FLAGS.video_episodes > 0:
-        assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
-    if FLAGS.online_steps > 0:
-        assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
+    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack, aloha_task=FLAGS.aloha_task)
+    # if FLAGS.video_episodes > 0:
+    #     assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
+    # if FLAGS.online_steps > 0:
+    #     assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
 
     # Initialize agent.
     random.seed(FLAGS.seed)
