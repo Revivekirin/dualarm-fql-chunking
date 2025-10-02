@@ -75,7 +75,17 @@ def evaluate(
             action = np.array(action)
             action = np.clip(action, -1, 1)
 
-            next_observation, reward, terminated, truncated, info = env.step(action)
+            try:
+                next_observation, reward, terminated, truncated, info = env.step(action)
+            except Exception as e:
+                print("[EVAL] physics error -> early reset:", repr(e))
+                try:
+                    next_observation, info = env.reset()
+                except Exception as e2:
+                    print("[EVAL] reset failed:", repr(e2))
+                    break #end current traj.
+                terminated, truncated = True, True
+
             done = terminated or truncated
             step += 1
 
