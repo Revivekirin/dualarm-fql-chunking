@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=sac
-#SBATCH --nodelist=pat-t3
+#SBATCH --job-name=fql
+#SBATCH --nodelist=pat-t7
 #SBATCH --output=log_rl_%j.out
 #SBATCH --error=log_rl_%j.err
 #SBATCH --gres=gpu:1
@@ -10,19 +10,19 @@
 
 conda init
 conda activate fql
-cd ~/workspace2/fql
+cd ~/workspace2/dualarm-fql-chunking
 
 export MUJOCO_GL=egl
-export EGL_DEVICE_ID=0        # 다중 GPU면 원하는 인덱스
-export GYM_DISABLE_PLUGIN_ENTRYPOINTS=1  # 불필요한 플러그인 로딩 방지
+export EGL_DEVICE_ID=0        
+export GYM_DISABLE_PLUGIN_ENTRYPOINTS=1 
 
-
+# initial running
 python main.py   \
  --env_name=gym-aloha   \
  --online_steps=1000000  \
  --offline_steps=300000 \
  --video_episodes=5  \
- --agent=agents/sac.py \
- --save_interval=100000 \ 
-
-
+ --agent=agents/fql.py \
+ --save_interval=100000 \
+ --aloha_task=sim_transfer \
+ --balanced_sampling=1

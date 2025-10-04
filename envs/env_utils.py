@@ -262,6 +262,7 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
     Returns:
         A tuple of the environment, evaluation environment, training dataset, and validation dataset.
     """
+    already_clipped = False
 
     if 'singletask' in env_name:
         # OGBench.
@@ -321,16 +322,6 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
         # ---- load parquet (dict)
         train_dataset, val_dataset = _load_aloha_parquet_dataset(dataset_root, val_ratio=val_ratio)
 
-        # ---- clip actions (dict)
-        if action_clip_eps is not None:
-            def _clip_actions(ds: dict, eps: float):
-                out = ds.copy()
-                out["actions"] = np.clip(out["actions"], -1 + eps, 1 - eps)
-                return out
-            train_dataset = _clip_actions(train_dataset, action_clip_eps)
-            if val_dataset is not None:
-                val_dataset = _clip_actions(val_dataset, action_clip_eps)
-
         # ----------------- dataset helper -----------------
         try:
             from flax.core.frozen_dict import FrozenDict
@@ -359,12 +350,17 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
             m["masks"] = (1 - np.clip(terms | timeo, 0, 1)).astype(np.float32)
             return m
         # ---------------------------------------------------
-
-        # 액션 클리핑
+        
+        # ---- clip actions (dict)
         if action_clip_eps is not None:
+            def _clip_actions_any(ds, eps: float):
+                m = _to_mutable_mapping(ds)
+                m["actions"] = np.clip(m["actions"], -1 + eps, 1 - eps)
+                return m
             train_dataset = _clip_actions_any(train_dataset, action_clip_eps)
             if val_dataset is not None:
                 val_dataset = _clip_actions_any(val_dataset, action_clip_eps)
+            already_clipped = True 
 
         # 마스크 보장
         train_dataset = _ensure_masks_any(train_dataset)
@@ -372,7 +368,6 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
             val_dataset = _ensure_masks_any(val_dataset)
 
         # dict/FrozenDict -> Dataset 객체
-        from utils.datasets import Dataset
         train_dataset = Dataset.create(**train_dataset)
         if val_dataset is not None:
             val_dataset = Dataset.create(**val_dataset)
@@ -388,13 +383,12 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
     eval_env.reset()
 
     # Clip dataset actions.
-    if action_clip_eps is not None:
+    if action_clip_eps is not None and not already_clipped:  
         if isinstance(train_dataset, dict):
             train_dataset = _clip_actions(train_dataset, action_clip_eps)
             if val_dataset is not None:
                 val_dataset = _clip_actions(val_dataset, action_clip_eps)
         else:
-            # D4RL Dataset 객체 등은 기존 코드 유지
             train_dataset = train_dataset.copy(
                 add_or_replace=dict(actions=np.clip(train_dataset['actions'], -1 + action_clip_eps, 1 - action_clip_eps))
             )

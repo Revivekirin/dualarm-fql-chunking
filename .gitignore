@@ -6,3 +6,5 @@ __pycache__/
 
 *.err
 *.out
+
+/slurm/
