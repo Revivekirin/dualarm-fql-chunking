@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fql
-#SBATCH --nodelist=pat-t7
+#SBATCH --nodelist=pat-t4
 #SBATCH --output=log_rl_%j.out
 #SBATCH --error=log_rl_%j.err
 #SBATCH --gres=gpu:1

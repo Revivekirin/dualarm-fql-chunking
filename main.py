@@ -30,7 +30,7 @@ flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
 flags.DEFINE_integer('online_steps', 0, 'Number of online steps.')
-flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
+flags.DEFINE_integer('buffer_size', 200000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
@@ -47,6 +47,59 @@ flags.DEFINE_string("aloha_task", "sim_insertion", "aloha task")
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
+import cv2
+import copy
+
+def _resize_top(ob, img_hw):
+    if isinstance(ob, dict) and 'pixels' in ob and isinstance(ob['pixels'], dict) and 'top' in ob['pixels']:
+        img = ob['pixels']['top']
+        if isinstance(img, (np.ndarray,)) and img.ndim == 3:
+            h, w = img.shape[:2]
+            H, W = img_hw
+            if (h, w) != (H, W):
+                ob = copy.deepcopy(ob)
+                ob['pixels']['top'] = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
+    return ob
+
+def _tree_slice_i(tree, i):
+    if isinstance(tree, dict):
+        return {k: _tree_slice_i(v, i) for k, v in tree.items()}
+    if isinstance(tree, (list, tuple)):
+        out = [_tree_slice_i(v, i) for v in tree]
+        return type(tree)(out)
+    try:
+        arr = np.asarray(tree)
+        if arr.ndim >= 1 and arr.shape[0] > i:
+            return arr[i]
+        return tree
+    except Exception:
+        return tree
+
+
+# def _batch_size_of(batch):
+#     leaves = []
+#     def _collect(x):
+#         leaves.append(x)
+#         return x
+#     jax.tree_util.tree_map(_collect, batch)
+#     for v in leaves:
+#         try:
+#             a = np.asarray(v)
+#             if a.ndim >= 1:
+#                 return a.shape[0]
+#         except Exception:
+#             pass
+#     return 1
+
+
+def _bytes_of_tree(x):
+    if isinstance(x, dict):
+        return sum(_bytes_of_tree(v) for v in x.values())
+    arr = np.asarray(x)
+    return arr.nbytes
+
+
+# -----------------------------------------------------------------------------
 
 def main(_):
     # Set up logger.
@@ -61,39 +114,98 @@ def main(_):
 
     # Make environment and datasets.
     config = FLAGS.agent
-    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack, aloha_task=FLAGS.aloha_task)
-    # if FLAGS.video_episodes > 0:
-    #     assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
-    # if FLAGS.online_steps > 0:
-    #     assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
+    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(
+        FLAGS.env_name, frame_stack=FLAGS.frame_stack, aloha_task=FLAGS.aloha_task
+    )
 
-    # Initialize agent.
+    # --------------------------- 스트리밍 여부 판정 ---------------------------
+    is_streaming = hasattr(train_dataset, "stream_batches")
+
+    if not is_streaming and isinstance(train_dataset, dict):
+        train_dataset = Dataset.create(**train_dataset)
+    if isinstance(val_dataset, dict):
+        val_dataset = Dataset.create(**val_dataset)
+
+    # Initialize agent random seeds.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
-    # Set up datasets.
-    train_dataset = Dataset.create(**train_dataset)
-    if FLAGS.balanced_sampling:
-        # Create a separate replay buffer so that we can sample from both the training dataset and the replay buffer.
-        example_transition = {k: v[0] for k, v in train_dataset.items()}
-        replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+    # ----------------------- 스트리밍: 버퍼 생성/워밍업 -----------------------
+    stream_iter = None
+    replay_buffer = None
+    if is_streaming:
+        bs = int(config['batch_size'])
+        if hasattr(train_dataset, "set_batch_size"):
+            train_dataset.set_batch_size(bs)
+        stream_iter = train_dataset.stream_batches(batch_size=bs)
+
+        # warm_batch 확보
+        try:
+            warm_batch = next(stream_iter)
+        except StopIteration:
+            stream_iter = train_dataset.stream_batches(batch_size=bs)
+            warm_batch = next(stream_iter)
+
+        # 메모리 타깃(기본 8GB) 기준으로 버퍼 용량 캡핑
+        target_bytes = int(os.getenv("RB_TARGET_BYTES", str(8 * 1024**3)))
+        example_transition = {k: _tree_slice_i(v, 0) for k, v in warm_batch.items()}
+        bytes_per = _bytes_of_tree(example_transition)
+        max_size = max(128, int(target_bytes // max(bytes_per, 1)))
+        safe_size = min(FLAGS.buffer_size, max_size)
+        if FLAGS.buffer_size > safe_size:
+            print(f"[ReplayBuffer] requested_size={FLAGS.buffer_size} -> capped to {safe_size} "
+                  f"(~{bytes_per/1e6:.2f} MB/transition, target ~{target_bytes/1e9:.1f} GB)")
+
+        # 버퍼 생성
+        replay_buffer = ReplayBuffer.create(example_transition, size=safe_size)
+
+        # warm_batch 일괄 적재
+        replay_buffer.add_batch(warm_batch)
+
+        # 추가 워밍업
+        target_warm = min(replay_buffer.max_size, 2048)
+        while replay_buffer.size < target_warm:
+            try:
+                stream_batch = next(stream_iter)
+            except StopIteration:
+                stream_iter = train_dataset.stream_batches(batch_size=bs)
+                stream_batch = next(stream_iter)
+            replay_buffer.add_batch(stream_batch)
+
+        if FLAGS.balanced_sampling:
+            print("[INFO] Streaming mode: ignoring balanced_sampling; sampling only from replay buffer.")
+
+        train_dataset = replay_buffer
+
     else:
-        # Use the training dataset as the replay buffer.
-        train_dataset = ReplayBuffer.create_from_initial_dataset(
-            dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
-        )
-        replay_buffer = train_dataset
-    # Set p_aug and frame_stack.
+        # ----------------------- 비스트리밍: 기존 로직 -----------------------
+        if FLAGS.balanced_sampling:
+            example_transition = {k: v[0] for k, v in train_dataset.items()}
+            replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+        else:
+            train_dataset = ReplayBuffer.create_from_initial_dataset(
+                dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1)
+            )
+            replay_buffer = train_dataset
+
+    # p_aug / frame_stack 설정
     for dataset in [train_dataset, val_dataset, replay_buffer]:
         if dataset is not None:
-            dataset.p_aug = FLAGS.p_aug
-            dataset.frame_stack = FLAGS.frame_stack
-            if config['agent_name'] == 'rebrac':
+            if hasattr(dataset, "p_aug"):
+                dataset.p_aug = FLAGS.p_aug
+            if hasattr(dataset, "frame_stack"):
+                dataset.frame_stack = FLAGS.frame_stack
+            if config['agent_name'] == 'rebrac' and hasattr(dataset, "return_next_actions"):
                 dataset.return_next_actions = True
 
-    # Create agent.
-    example_batch = train_dataset.sample(1)
+    # --------------------------- 에이전트 생성용 예시 배치 --------------------------
+    if is_streaming:
+        # 에이전트 create가 (B=1) 배치를 기대한다면 간단히 [:1]
+        example_batch = {k: (v[:1] if isinstance(v, np.ndarray) else v) for k, v in warm_batch.items()}
+    else:
+        example_batch = train_dataset.sample(1)
 
+    # Create agent.
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
         FLAGS.seed,
@@ -116,33 +228,61 @@ def main(_):
     done = True
     expl_metrics = dict()
     online_rng = jax.random.PRNGKey(FLAGS.seed)
+
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if i <= FLAGS.offline_steps:
-            # Offline RL.
-            batch = train_dataset.sample(config['batch_size'])
+            # ----------------------- Offline RL -----------------------
+            if is_streaming: #TODO: offline RL은 train_dataset에서만
+                try:
+                    stream_batch = next(stream_iter)
+                except StopIteration:
+                    stream_iter = train_dataset.stream_batches(batch_size=int(config['batch_size']))
+                    stream_batch = next(stream_iter)
+                replay_buffer.add_batch(stream_batch)
+                batch = replay_buffer.sample(config['batch_size'])
+            else:
+                batch = train_dataset.sample(config['batch_size'])
 
             if config['agent_name'] == 'rebrac':
                 agent, update_info = agent.update(batch, full_update=(i % config['actor_freq'] == 0))
             else:
                 agent, update_info = agent.update(batch)
+
         else:
-            # Online fine-tuning.
+            # ----------------------- Online fine-tuning -----------------------
             online_rng, key = jax.random.split(online_rng)
+
+            # if done:
+            #     step = 0
+            #     ob, _ = env.reset()
+
+            # batched_ob = jax.tree_util.tree_map(lambda x: np.asarray(x)[None, ...], ob)
+            # actions_batched = agent.sample_actions(observations=batched_ob, temperature=1, seed=key)
+            # action = np.asarray(actions_batched, dtype=np.float32)[0]
+            # next_ob, reward, terminated, truncated, info = env.step(action)
+            # done = terminated or truncated
+            # reset
 
             if done:
                 step = 0
                 ob, _ = env.reset()
+                ob = _resize_top(ob, config.get('img_hw', (240, 320)))
 
-            action = agent.sample_actions(observations=ob, temperature=1, seed=key)
-            action = np.array(action)
+            # 액션 샘플링
+            batched_ob = jax.tree_util.tree_map(lambda x: np.asarray(x)[None, ...], ob)
+            actions_batched = agent.sample_actions(observations=batched_ob, temperature=1, seed=key)
+            action = np.asarray(actions_batched, dtype=np.float32)[0]
 
-            next_ob, reward, terminated, truncated, info = env.step(action.copy())
+            # step
+            next_ob, reward, terminated, truncated, info = env.step(action)
+            next_ob = _resize_top(next_ob, config.get('img_hw', (240, 320)))  
             done = terminated or truncated
+
+
 
             if 'antmaze' in FLAGS.env_name and (
                 'diverse' in FLAGS.env_name or 'play' in FLAGS.env_name or 'umaze' in FLAGS.env_name
             ):
-                # Adjust reward for D4RL antmaze.
                 reward = reward - 1.0
 
             replay_buffer.add_transition(
@@ -162,9 +302,7 @@ def main(_):
 
             step += 1
 
-            # Update agent.
-            if FLAGS.balanced_sampling:
-                # Half-and-half sampling from the training dataset and the replay buffer.
+            if (FLAGS.balanced_sampling and not is_streaming):
                 dataset_batch = train_dataset.sample(config['batch_size'] // 2)
                 replay_batch = replay_buffer.sample(config['batch_size'] // 2)
                 batch = {k: np.concatenate([dataset_batch[k], replay_batch[k]], axis=0) for k in dataset_batch}

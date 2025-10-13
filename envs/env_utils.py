@@ -13,7 +13,7 @@ import glob
 import numpy as np
 import gymnasium as gym
 
-from envs.load_paraquet import _load_aloha_parquet_dataset, _load_aloha_scripted_dataset
+from envs.load_paraquet import build_aloha_streamer
 
 from gymnasium.spaces import Box, Dict as DictSpace
 
@@ -251,16 +251,19 @@ def _clip_actions(dataset: dict, action_clip_eps: float):
     )
     return clipped
 
-def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloha_task=None):
-    """Make offline RL environment and datasets.
-
-    Args:
-        env_name: Name of the environment or dataset.
-        frame_stack: Number of frames to stack.
-        action_clip_eps: Epsilon for action clipping.
-
-    Returns:
-        A tuple of the environment, evaluation environment, training dataset, and validation dataset.
+def make_env_and_datasets(env_name,
+                          frame_stack=None,
+                          action_clip_eps=1e-5,
+                          aloha_task=None,
+                          use_pixels=True,
+                          use_streaming=True,            
+                          streamer_batch_size=64,        
+                          streamer_shuffle_buffer=4096,  
+                          seed=42):                     
+    """
+    Make offline RL environment and datasets.
+    Returns: env, eval_env, train_dataset, val_dataset
+    train_dataset 가 스트리밍이면 .stream_batches() 제너레이터를 제공합니다.
     """
     already_clipped = False
 
@@ -291,7 +294,7 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
         train_dataset, val_dataset = dataset, None
 
     elif env_name == 'gym-aloha' or env_name.startswith('gym-aloha'):
-        import importlib, os
+        import importlib, os, gymnasium
         importlib.import_module("gym_aloha")  # ensure registration
 
         if aloha_task=="sim_insertion":
@@ -299,7 +302,10 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
             dataset_root = os.environ.get("ALOHA_DATASET_DIR", "gym-aloha/aloha_sim_insertion_scripted_image")
         elif aloha_task=="sim_transfer":
             env_id = os.environ.get("ALOHA_ENV_ID", "gym_aloha/AlohaTransferCube-v0")
-            dataset_root=os.environ.get("ALOHA_DATASET_DIR", "gym-aloha/aloha_sim_transfer_cube_scripted_image")
+            dataset_root = os.environ.get("ALOHA_DATASET_DIR", "gym-aloha/aloha_sim_transfer_cube_scripted_image")
+        else:
+            raise ValueError(f"Unknown aloha_task: {aloha_task}")
+
         val_ratio = float(os.environ.get("ALOHA_VAL_RATIO", "0.1"))
 
         # headless
@@ -313,68 +319,80 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
 
-        ob_key = "agent_pos" 
-        env = SelectObsKey(env, key=ob_key, last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
-        eval_env = SelectObsKey(eval_env, key=ob_key, last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
+        if not use_pixels:
+            env = SelectObsKey(env, key="agent_pos", last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
+            eval_env = SelectObsKey(eval_env, key="agent_pos", last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
+
         env = SafeActionWrapper(env, max_norm_scale=1.0)
         eval_env = SafeActionWrapper(eval_env, max_norm_scale=1.0)
 
-        # ---- load parquet (dict)
-        train_dataset, val_dataset = _load_aloha_parquet_dataset(dataset_root, val_ratio=val_ratio)
+        if use_streaming:
 
-        # ----------------- dataset helper -----------------
-        try:
-            from flax.core.frozen_dict import FrozenDict
-        except Exception:
-            FrozenDict = ()
+            train_dataset = build_aloha_streamer(
+                root_dir=dataset_root,
+                batch_size=streamer_batch_size,
+                shuffle_buffer=streamer_shuffle_buffer,
+                seed=seed,
+                use_pixels=use_pixels,
+            )
+            val_dataset = None
 
-        def _to_mutable_mapping(ds):
-            if isinstance(ds, dict):
-                return dict(ds)
-            if FrozenDict and isinstance(ds, FrozenDict):
-                return dict(ds.unfreeze())
+            # 액션 클립/마스크는 학습 루프에서 배치 단위로 적용하세요.
+            already_clipped = True  # 이후 공용 클립 로직이 다시 돌지 않도록
+        else:
+            # --------- 기존 경로(메모리 로드) ---------
+            # train_dataset, val_dataset = _load_aloha_parquet_dataset(
+            #     dataset_root, val_ratio=val_ratio, use_pixels=use_pixels
+            # )
+
+            # 보조 유틸들
             try:
-                return dict(ds)
+                from flax.core.frozen_dict import FrozenDict
             except Exception:
-                raise TypeError(f"Unsupported dataset mapping type: {type(ds)}")
+                FrozenDict = ()
 
-        def _clip_actions_any(ds, eps: float):
-            m = _to_mutable_mapping(ds)
-            m["actions"] = np.clip(m["actions"], -1 + eps, 1 - eps)
-            return m
+            # def _to_mutable_mapping(ds):
+            #     if isinstance(ds, dict):
+            #         return dict(ds)
+            #     if FrozenDict and isinstance(ds, FrozenDict):
+            #         return dict(ds.unfreeze())
+            #     try:
+            #         return dict(ds)
+            #     except Exception:
+            #         raise TypeError(f"Unsupported dataset mapping type: {type(ds)}")
 
-        def _ensure_masks_any(ds):
-            m = _to_mutable_mapping(ds)
-            terms = m["terminals"].astype(np.uint8)
-            timeo = m.get("timeouts", np.zeros_like(terms, dtype=np.uint8)).astype(np.uint8)
-            m["masks"] = (1 - np.clip(terms | timeo, 0, 1)).astype(np.float32)
-            return m
-        # ---------------------------------------------------
-        
-        # ---- clip actions (dict)
-        if action_clip_eps is not None:
-            def _clip_actions_any(ds, eps: float):
-                m = _to_mutable_mapping(ds)
-                m["actions"] = np.clip(m["actions"], -1 + eps, 1 - eps)
-                return m
-            train_dataset = _clip_actions_any(train_dataset, action_clip_eps)
-            if val_dataset is not None:
-                val_dataset = _clip_actions_any(val_dataset, action_clip_eps)
-            already_clipped = True 
+            # def _ensure_masks_any(ds):
+            #     m = _to_mutable_mapping(ds)
+            #     terms = m["terminals"].astype(np.uint8)
+            #     timeo = m.get("timeouts", np.zeros_like(terms, dtype=np.uint8)).astype(np.uint8)
+            #     m["masks"] = (1 - np.clip(terms | timeo, 0, 1)).astype(np.float32)
+            #     return m
 
-        # 마스크 보장
-        train_dataset = _ensure_masks_any(train_dataset)
-        if val_dataset is not None:
-            val_dataset = _ensure_masks_any(val_dataset)
+            # # action clip (배열 기반일 때만)
+            # if action_clip_eps is not None:
+            #     def _clip_actions_any(ds, eps: float):
+            #         m = _to_mutable_mapping(ds)
+            #         m["actions"] = np.clip(m["actions"], -1 + eps, 1 - eps)
+            #         return m
+            #     train_dataset = _clip_actions_any(train_dataset, action_clip_eps)
+            #     if val_dataset is not None:
+            #         val_dataset = _clip_actions_any(val_dataset, action_clip_eps)
+            #     already_clipped = True
 
-        # dict/FrozenDict -> Dataset 객체
-        train_dataset = Dataset.create(**train_dataset)
-        if val_dataset is not None:
-            val_dataset = Dataset.create(**val_dataset)
+            # # mask 생성
+            # train_dataset = _ensure_masks_any(train_dataset)
+            # if val_dataset is not None:
+            #     val_dataset = _ensure_masks_any(val_dataset)
+
+            # # Dataset 포맷으로 감싸기
+            # train_dataset = Dataset.create(**train_dataset)
+            # if val_dataset is not None:
+            #     val_dataset = Dataset.create(**val_dataset)
 
     else:
         raise ValueError(f'Unsupported environment: {env_name}')
 
+    frame_stack=None if use_pixels==True else frame_stack
     if frame_stack is not None:
         env = FrameStackWrapper(env, frame_stack)
         eval_env = FrameStackWrapper(eval_env, frame_stack)

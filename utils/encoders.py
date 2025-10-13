@@ -1,10 +1,56 @@
 import functools
-from typing import Sequence
+from typing import Sequence, Any, Dict
 
 import flax.linen as nn
 import jax.numpy as jnp
 
 from utils.networks import MLP
+
+class ProprioEncoder(nn.Module):
+    hidden_dims: Sequence[int] = (256,)
+    layer_norm: bool = False
+
+    @nn.compact
+    def __call__(self, x):
+        x = x.astype(jnp.float32)
+        return MLP(self.hidden_dims, activate_final=True, layer_norm=self.layer_norm)(x)
+
+class AlohaMultiModalEncoder(nn.Module):
+    """pixels.top + agent_pos 를 받아 concat 임베딩을 반환."""
+    impala_num_blocks: int = 1
+    impala_stack_sizes: tuple = (16, 128, 128)
+    impala_width: int = 1
+    impala_layer_norm: bool = False
+    impala_mlp_hidden: Sequence[int] = (512,)
+
+    # proprio 인코더 설정
+    proprio_hidden: Sequence[int] = (256,)
+    proprio_layer_norm: bool = False
+
+    @nn.compact
+    def __call__(self, obs: Dict[str, Any], train: bool = True):
+        img = obs["pixels"]["top"]
+        proprio = obs["agent_pos"]
+        print("[DEBUG] img.shape :", img.shape)
+        print("[DEBUG] proprio.shape :", proprio.shape)
+
+        # IMPALA
+        impala = ImpalaEncoder(
+            width=self.impala_width,
+            stack_sizes=self.impala_stack_sizes,
+            num_blocks=self.impala_num_blocks,
+            mlp_hidden_dims=self.impala_mlp_hidden,
+            layer_norm=self.impala_layer_norm,
+        )
+        f_img = impala(img, train=train)   # (B, F_img)
+
+        # proprio MLP
+        f_prop = ProprioEncoder(
+            hidden_dims=self.proprio_hidden,
+            layer_norm=self.proprio_layer_norm,
+        )(proprio)                         # (B, F_prop)
+
+        return jnp.concatenate([f_img, f_prop], axis=-1)
 
 
 class ResnetStack(nn.Module):
@@ -105,4 +151,5 @@ encoder_modules = {
     'impala_debug': functools.partial(ImpalaEncoder, num_blocks=1, stack_sizes=(4, 4)),
     'impala_small': functools.partial(ImpalaEncoder, num_blocks=1),
     'impala_large': functools.partial(ImpalaEncoder, stack_sizes=(64, 128, 128), mlp_hidden_dims=(1024,)),
+    'aloha_mm': AlohaMultiModalEncoder, 
 }

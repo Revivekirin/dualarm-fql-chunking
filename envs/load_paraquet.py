@@ -1,147 +1,344 @@
-import os
-
+import os, glob
 import numpy as np
-import ogbench
-
-from utils.datasets import Dataset
-import glob
-import numpy as np
-
-# parquet 읽기용
-try:
-    import pyarrow.dataset as pads
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    _HAVE_ARROW = True
-except Exception:
-    _HAVE_ARROW = False
-
-try:
-    import pandas as pd
-    _HAVE_PANDAS = True
-except Exception:
-    _HAVE_PANDAS = False
-
-
-def _as_numpy_array_col(series_or_chunked):
-    """
-    PyArrow(또는 pandas) 컬럼에서 row마다 list/ndarray가 들어있는 경우를
-    (N, ...) numpy 로 깔끔히 변환.
-    """
-    if _HAVE_PANDAS and isinstance(series_or_chunked, pd.Series):
-        data = series_or_chunked.to_numpy()
-    else:
-        # pyarrow Array -> python list
-        data = series_or_chunked.to_pylist()
-    # 각 원소가 list/np.ndarray 라고 가정하고 stack
-    arr0 = np.asarray(data[0])
-    shape = (len(data),) + arr0.shape
-    out = np.empty(shape, dtype=arr0.dtype)
-    for i, v in enumerate(data):
-        out[i] = np.asarray(v)
-    return out
-
-import os, glob, numpy as np
-import pyarrow.dataset as pads
+from io import BytesIO
+from PIL import Image
 import pyarrow as pa
+import pyarrow.dataset as pads
+import pyarrow.compute as pc
+from collections import deque
+import random
+from typing import Dict, Iterator, Optional, Tuple, List
 
-def _load_aloha_parquet_dataset(root_dir: str, val_ratio: float = 0.1):
-    data_dir = os.path.join(root_dir, "data")
-    files = glob.glob(os.path.join(data_dir, "**", "*.parquet"), recursive=True)
-    if not files:
-        raise FileNotFoundError(f"No parquet files found under: {data_dir}")
-
-    ds = pads.dataset(files, format="parquet")
-    table = ds.to_table()
-    print(table)
-
-    cols = {name.lower(): name for name in table.column_names}
-    def has(*cands): return next((cols[c] for c in cands if c in cols), None)
-
-    # ★ 현재 스키마에 맞춘 매핑
-    obs_col  = has("observation.state", "observations", "obs", "state", "states")
-    act_col  = has("action", "actions")
-    done_col = has("next.done", "dones", "done", "terminals", "terminal")
-    rew_col  = has("rewards", "reward")  # 없으면 0
-    ep_col   = has("episode_index", "episode", "episode_id", "traj_id")
-    step_col = has("frame_index", "t", "step", "time", "timestamp")
-
-    if not obs_col or not act_col:
-        raise KeyError(f"Required columns not found. Found: {list(cols.keys())}")
-
-    def _as_np(colname):
-        data = table[colname].to_pylist()
-        arr0 = np.asarray(data[0])
-        out = np.empty((len(data),)+arr0.shape, dtype=arr0.dtype)
-        for i,v in enumerate(data):
-            out[i] = np.asarray(v)
-        return out
-
-    obs = _as_np(obs_col)
-    act = _as_np(act_col)
-    rew = _as_np(rew_col).squeeze(-1) if rew_col else np.zeros((len(act),), dtype=np.float32)
-
-    if done_col:
-        try:
-            done = np.asarray(table[done_col].to_numpy(zero_copy_only=False)).astype(bool)
-        except Exception:
-            done = np.asarray(table[done_col].to_pylist()).astype(bool)
-    else:
-        done = np.zeros((len(act),), dtype=bool)
-
-    ep   = np.asarray(table[ep_col].to_numpy(zero_copy_only=False)) if ep_col else np.zeros((len(act),), dtype=np.int64)
-    step = np.asarray(table[step_col].to_numpy(zero_copy_only=False)) if step_col else np.arange(len(act))
-
-    # 정렬
-    order = np.lexsort((step, ep))
-    obs, act, rew, done, ep = obs[order], act[order], rew[order], done[order], ep[order]
-
-    # 에피소드별 next_obs, terminals
-    obs_list, act_list, rew_list, term_list, next_obs_list = [], [], [], [], []
-    uniq, starts = np.unique(ep, return_index=True)
-    ends = np.r_[starts[1:], len(ep)]
-    for s,e in zip(starts, ends):
-        o, a, r, d = obs[s:e], act[s:e], rew[s:e], done[s:e].copy()
-        if not d.any(): d[-1] = True           # 마지막 전이 강제 terminal
-        no = np.concatenate([o[1:], o[-1:]], axis=0)
-        obs_list.append(o); act_list.append(a); rew_list.append(r); term_list.append(d); next_obs_list.append(no)
-
-    observations      = np.concatenate(obs_list, axis=0)
-    actions           = np.concatenate(act_list, axis=0)
-    rewards           = np.concatenate(rew_list, axis=0)
-    terminals         = np.concatenate(term_list, axis=0).astype(np.uint8)
-    next_observations = np.concatenate(next_obs_list, axis=0)
+import cv2
+from concurrent.futures import ThreadPoolExecutor
 
 
-    # split
-    N = len(actions)
-    n_val = int(N * float(val_ratio))
-    rng = np.random.RandomState(42)
-    perm = rng.permutation(N)
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
+# ---------- PNG decode ----------
+def _decode_png_to_array(byte_arr: bytes) -> np.ndarray:
+    with Image.open(BytesIO(byte_arr)) as im:
+        im = im.convert("RGB")
+        return np.asarray(im, dtype=np.uint8)
 
-    def _slice(idx_):
-        terms = terminals[idx_].astype(np.uint8)
-        timeo = np.zeros_like(terms, dtype=np.uint8)
-        masks = (1 - np.clip(terms | timeo, 0, 1)).astype(np.float32)
+
+# ---------- batched Arrow helpers ----------
+def _iter_batches(ds: pads.Dataset, columns: List[str], batch_size: int = 65536):
+    scanner = ds.scanner(columns=columns, batch_size=batch_size, use_threads=True)
+    for rb in scanner.to_batches():
+        yield rb
+
+
+def _column_as_numpy(rb: pa.RecordBatch, name: str) -> np.ndarray:
+    col = rb.column(rb.schema.get_field_index(name))
+    try:
+        return col.to_numpy(zero_copy_only=False)
+    except Exception:
+        return np.asarray(col.to_pylist())
+
+
+# ---------- (ep, step) 정렬 인덱스 ----------
+def _sorted_index(ds: pads.Dataset, ep_col: str, step_col: str) -> Tuple[np.ndarray, np.ndarray]:
+    eps, steps, ptrs = [], [], []
+    total = 0
+    for rb in _iter_batches(ds, [ep_col, step_col], batch_size=200_000):
+        e = _column_as_numpy(rb, ep_col).astype(np.int64)
+        s = _column_as_numpy(rb, step_col).astype(np.int64)
+        n = len(e)
+        eps.append(e)
+        steps.append(s)
+        ptrs.append(np.arange(total, total + n, dtype=np.int64))
+        total += n
+    eps = np.concatenate(eps, 0)
+    steps = np.concatenate(steps, 0)
+    ptrs = np.concatenate(ptrs, 0)
+    order = np.lexsort((steps, eps))
+    return order, ptrs
+
+
+# ---------- 전이 스트리머 ----------
+class AlohaTransitionStreamer:
+    """
+    Parquet을 에피소드-스텝 정렬 순서로 순회하며 (s, a, r, s', done, mask) 전이를 생성.
+    픽셀은 PNG 바이트를 '필요한 순간'에만 디코드.
+    완전 스트리밍: 전체 N·H·W·C 배열 사전할당/메모리맵 없음.
+    """
+
+    def __init__(
+        self,
+        root_dir: str,
+        use_pixels: bool = True,
+        shuffle_buffer: int = 2048,
+        seed: int = 42,
+        batch_size: int = 128,
+        default_batch_size: int = 256,
+    ):
+        self.root_dir = root_dir
+        self.use_pixels = use_pixels
+        self.shuffle_buffer = shuffle_buffer
+        self.batch_size = int(batch_size)
+        self.rng = random.Random(seed)
+        self.default_batch_size = int(default_batch_size)
+
+        data_dir = os.path.join(root_dir, "data")
+        self.files = glob.glob(os.path.join(data_dir, "**", "*.parquet"), recursive=True)
+        if not self.files:
+            raise FileNotFoundError(f"No parquet found under {data_dir}")
+        self.ds = pads.dataset(self.files, format="parquet")
+
+        names = self.ds.schema.names
+        cols = {n.lower(): n for n in names}
+
+        def has(*cands): return next((cols[c] for c in cands if c in cols), None)
+
+        self.img_col = has("observation.images.top")
+        self.state_col = has("observation.state", "observations", "obs", "state", "states")
+        self.act_col = has("action", "actions")
+        self.done_col = has("next.done", "dones", "done", "terminals", "terminal")
+        self.rew_col = has("rewards", "reward")
+        self.ep_col = has("episode_index", "episode", "episode_id", "traj_id")
+        self.step_col = has("frame_index", "t", "step", "time", "timestamp")
+        if not (self.state_col and self.act_col and self.ep_col and self.step_col):
+            raise KeyError(f"Missing required columns. Have: {list(cols.keys())}")
+
+        # 정렬용 인덱스
+        self.order, self.row_ptrs = _sorted_index(self.ds, self.ep_col, self.step_col)
+
+        # 에피소드 인덱스 전체 확보
+        eps = []
+        for rb in _iter_batches(self.ds, [self.ep_col], batch_size=200_000):
+            eps.append(_column_as_numpy(rb, self.ep_col).astype(np.int64))
+        self.ep_all = np.concatenate(eps, 0)[self.order]
+
+        # ⚡ list 기반 셔플 버퍼 (O(B) random pop)
+        self._buffer: list = []
+        self._episode_cache: Dict[int, Dict[str, list]] = {}
+
+    def __iter__(self):
+        yield from self.stream_batches(batch_size=self.default_batch_size)
+
+    def _push_episode_item(self, ep: int, item: dict):
+        cache = self._episode_cache.setdefault(ep, dict(
+            state=[], action=[], reward=[], done=[], pixels_top=[]
+        ))
+        cache["state"].append(item["state"])
+        cache["action"].append(item["action"])
+        cache["reward"].append(item["reward"])
+        cache["done"].append(item["done"])
+        if self.use_pixels:
+            cache["pixels_top"].append(item["pixels_top"])
+
+
+    def _flush_episode_to_transitions(self, ep: int):
+        cache = self._episode_cache.pop(ep, None)
+        if cache is None or len(cache["state"]) == 0:
+            return
+
+        def shift_next(arr_list):
+            if len(arr_list) == 1:
+                return [arr_list[0]]
+            return arr_list[1:] + [arr_list[-1]]
+
+        next_state = shift_next(cache["state"])
+        if self.use_pixels:
+            next_pixels = shift_next(cache["pixels_top"])
+
+        for t in range(len(cache["state"])):
+            obs = {"agent_pos": cache["state"][t]}
+            nxt = {"agent_pos": next_state[t]}
+            if self.use_pixels:
+                obs.setdefault("pixels", {})["top"] = cache["pixels_top"][t]
+                nxt.setdefault("pixels", {})["top"] = next_pixels[t]
+
+            a = cache["action"][t]
+            r = cache["reward"][t]
+            d = bool(cache["done"][t])
+            m = 0.0 if d else 1.0
+
+            self._buffer.append((obs, a, r, np.uint8(d), nxt, np.float32(m)))
+
+    def _random_pop_batch(self) -> Optional[dict]:
+        if len(self._buffer) < self.batch_size:
+            return None
+        idxs = sorted(self.rng.sample(range(len(self._buffer)), self.batch_size), reverse=True)
+        sel = []
+        for i in idxs:
+            sel.append(self._buffer.pop(i))
+
+        def stack_agent(items):
+            return np.stack(items, 0).astype(np.float32)
+
+        obs_agent = stack_agent([b[0]["agent_pos"] for b in sel])
+        next_agent = stack_agent([b[4]["agent_pos"] for b in sel])
+
+        if self.use_pixels:
+            obs_pixels = np.stack([b[0]["pixels"]["top"] for b in sel], 0).astype(np.uint8)
+            next_pixels = np.stack([b[4]["pixels"]["top"] for b in sel], 0).astype(np.uint8)
+            observations = {"pixels": {"top": obs_pixels}, "agent_pos": obs_agent}
+            next_observations = {"pixels": {"top": next_pixels}, "agent_pos": next_agent}
+        else:
+            observations = obs_agent
+            next_observations = next_agent
+
+        actions = np.stack([b[1] for b in sel], 0).astype(np.float32)
+        rewards = np.asarray([b[2] for b in sel], np.float32)
+        terminals = np.asarray([b[3] for b in sel], np.uint8)
+        masks = np.asarray([b[5] for b in sel], np.float32)
+
         return dict(
-            observations      = observations[idx_],
-            actions           = actions[idx_],
-            rewards           = rewards[idx_],
-            terminals         = terminals[idx_],
-            # timeouts          = np.zeros_like(terminals[idx_]),
-            next_observations = next_observations[idx_],
-            masks             = masks,       
+            observations=observations,
+            actions=actions,
+            rewards=rewards,
+            terminals=terminals,
+            next_observations=next_observations,
+            masks=masks,
         )
 
-    train_dataset = _slice(train_idx)
-    val_dataset   = _slice(val_idx) if n_val > 0 else None
+    def _maybe_emit_batches(self) -> Iterator[dict]:
+        while len(self._buffer) >= self.batch_size:
+            batch = self._random_pop_batch()
+            if batch is None:
+                break
+            yield batch
 
-    print(f"[ALOHA parquet] train={len(train_dataset['actions'])}, val={0 if val_dataset is None else len(val_dataset['actions'])}")
-    print(f"[ALOHA parquet] obs={train_dataset['observations'].shape}, act={train_dataset['actions'].shape}")
+    def set_batch_size(self, bs: int):
+        self.batch_size = int(bs)
 
-    return train_dataset, val_dataset  
+    def stream_batches(self, batch_size: int | None = None) -> Iterator[dict]:
+        if batch_size is not None:
+            self.batch_size = int(batch_size)
 
+        need_cols = [self.state_col, self.act_col, self.ep_col, self.step_col]
+        if self.done_col:
+            need_cols.append(self.done_col)
+        if self.rew_col:
+            need_cols.append(self.rew_col)
+        if self.use_pixels:
+            if self.img_col is None:
+                raise KeyError("use_pixels=True 이지만 이미지 컬럼을 찾을 수 없습니다.")
+            need_cols.append(self.img_col)
+
+        N = len(self.order)
+        inv = np.empty_like(self.order)
+        inv[self.order] = np.arange(N, dtype=np.int64)
+        offset = 0
+        CHUNK = 50_000
+        if self.use_pixels:
+            CHUNK = 1024
+
+        acc_sorted_pos: List[int] = []
+        acc_items: List[Tuple[int, int, dict]] = []
+
+        for rb in _iter_batches(self.ds, need_cols, batch_size=CHUNK):
+            n = len(rb)
+            glob_idx = np.arange(offset, offset + n, dtype=np.int64)
+            where = inv[glob_idx]
+            offset += n
+
+            states = _column_as_numpy(rb, self.state_col)
+            acts = _column_as_numpy(rb, self.act_col)
+            eps = _column_as_numpy(rb, self.ep_col).astype(np.int64)
+            steps = _column_as_numpy(rb, self.step_col).astype(np.int64)
+            dones = _column_as_numpy(rb, self.done_col).astype(bool) if self.done_col else np.zeros((n,), bool)
+            rews = _column_as_numpy(rb, self.rew_col).astype(np.float32) if self.rew_col else np.zeros((n,), np.float32)
+
+            if self.use_pixels:
+                bytes_ca = pc.struct_field(rb[self.img_col], "bytes")
+                # bytes_ca = pc.struct_field(rb[self.img_col], "bytes")
+                # bytelist = [bytes_ca[i].as_py() for i in range(n)]
+
+                def _decode_resize_png_cv2(byte_arr: bytes, out_hw=(240, 320)) -> np.ndarray:
+                    buf = np.frombuffer(byte_arr, dtype=np.uint8)
+                    im = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    if im is None:
+                        raise ValueError("cv2.imdecode failed")
+                    h, w = out_hw
+                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA)
+                    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+                    return im
+
+                # workers = max(4, (os.cpu_count() or 8))
+                # with ThreadPoolExecutor(max_workers=workers) as ex:
+                #     imgs = list(ex.map(_decode_resize_png_cv2, bytelist))
+            else:
+                bytes_ca=None
+            
+            img = None
+            for i in range(n):
+                payload = {
+                    "state": states[i],
+                    "action": acts[i],
+                    "reward": rews[i],
+                    "done": dones[i],
+                }
+                if self.use_pixels:
+                    byte_arr = bytes_ca[i].as_py()
+                    img = _decode_resize_png_cv2(byte_arr, out_hw=(240, 320))
+                    payload["pixels_top"] = img
+
+                acc_sorted_pos.append(int(where[i]))
+                acc_items.append((int(eps[i]), int(steps[i]), payload))
+
+            if len(acc_sorted_pos) >= CHUNK:
+                yield from self._drain_acc(acc_sorted_pos, acc_items)
+                acc_sorted_pos.clear()
+                acc_items.clear()
+                yield from self._maybe_emit_batches()
+
+        if acc_sorted_pos:
+            yield from self._drain_acc(acc_sorted_pos, acc_items)
+            acc_sorted_pos.clear()
+            acc_items.clear()
+
+        for ep in list(self._episode_cache.keys()):
+            self._flush_episode_to_transitions(ep)
+
+        while True:
+            batch = self._random_pop_batch()
+            if batch is None:
+                break
+            yield batch
+
+    def _drain_acc(self, acc_sorted_pos: List[int], acc_items: List[Tuple[int, int, dict]]) -> Iterator[dict]:
+        if not acc_items:
+            return
+        order = np.argsort(np.asarray(acc_sorted_pos, dtype=np.int64))
+        last_ep = None
+
+        for j in order:
+            ep, _step, payload = acc_items[j]
+            last_ep = ep
+            if not self.use_pixels and ("pixels_top" in payload):
+                p2 = dict(payload)
+                p2.pop("pixels_top", None)
+                payload = p2
+
+            if last_ep is not None:
+                self._flush_episode_to_transitions(last_ep)
+                yield from self._maybe_emit_batches()
+
+            self._push_episode_item(ep, payload)
+            if bool(payload.get("done", False)):
+                self._flush_episode_to_transitions(ep)
+                yield from self._maybe_emit_batches()
+            last_ep = ep
+
+
+def build_aloha_streamer(
+    root_dir: str,
+    batch_size: int = 128,
+    shuffle_buffer: int = 2048,
+    seed: int = 42,
+    use_pixels: bool = True,
+    default_batch_size: int = 256,
+) -> AlohaTransitionStreamer:
+    streamer = AlohaTransitionStreamer(
+        root_dir=root_dir,
+        use_pixels=use_pixels,
+        shuffle_buffer=shuffle_buffer,
+        seed=seed,
+        batch_size=batch_size,
+        default_batch_size=default_batch_size,
+    )
+    return streamer
 
 
 def _load_aloha_scripted_dataset(
