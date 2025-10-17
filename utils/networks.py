@@ -225,8 +225,14 @@ class ActorVectorField(nn.Module):
         if not is_encoded and self.encoder is not None:
             observations = self.encoder(observations)
         if times is None:
+            print("observations shape:", observations)
+            print("actions shape:", actions)
+            if observations.ndim == actions.ndim + 1 and observations.shape[-2] == 1:
+                observations = jnp.squeeze(observations, axis=-2)
             inputs = jnp.concatenate([observations, actions], axis=-1)
         else:
+            if observations.ndim == actions.ndim + 1 and observations.shape[-2] == 1:
+                observations = jnp.squeeze(observations, axis=-2)
             inputs = jnp.concatenate([observations, actions, times], axis=-1)
 
         v = self.mlp(inputs)

@@ -13,17 +13,67 @@ import glob
 import numpy as np
 import gymnasium as gym
 
-from envs.load_paraquet import _load_aloha_parquet_dataset, _load_aloha_scripted_dataset
+from envs.load_paraquet2 import _load_aloha_parquet_dataset, _load_aloha_scripted_dataset
 
 from gymnasium.spaces import Box, Dict as DictSpace
 
+class FlattenAlohaObs(gym.ObservationWrapper):
+    """
+    {"pixels": {"top": HWC uint8}, "agent_pos": D}  -->
+    {"image": HWC uint8, "state": D float32}
+    """
+    def __init__(self, env, image_key=("pixels","top"), state_key="agent_pos"):
+        super().__init__(env)
+        self.image_key = image_key
+        self.state_key = state_key
 
-import numpy as np
-import gymnasium as gym
-from gymnasium.spaces import Box
+        obs_space = env.observation_space
+        if not isinstance(obs_space, DictSpace):
+            raise TypeError(f"Expect Dict obs, got {type(obs_space)}")
 
-import numpy as np
-import gymnasium as gym
+        # image subspace
+        if image_key[0] not in obs_space.spaces:
+            raise KeyError(f"Missing key '{image_key[0]}' in observation_space")
+        if not isinstance(obs_space.spaces[image_key[0]], DictSpace):
+            raise TypeError(f"'{image_key[0]}' must be a Dict subspace")
+        img_dict_space = obs_space.spaces[image_key[0]]
+        if image_key[1] not in img_dict_space.spaces:
+            raise KeyError(f"Missing key '{image_key[0]}/{image_key[1]}' in observation_space")
+
+        img_space = img_dict_space.spaces[image_key[1]]
+        if not isinstance(img_space, Box):
+            raise TypeError(f"Image subspace must be Box, got {type(img_space)}")
+
+        # Box에는 ndim이 없으므로 shape 길이로 확인
+        if not (img_space.dtype == np.uint8 and len(img_space.shape) == 3):
+            raise AssertionError(
+                f"Image Box must be uint8 and HWC 3D. Got dtype={img_space.dtype}, shape={img_space.shape}"
+            )
+
+        # state subspace
+        if state_key not in obs_space.spaces:
+            raise KeyError(f"Missing key '{state_key}' in observation_space")
+        st_space = obs_space.spaces[state_key]
+        if not isinstance(st_space, Box):
+            raise TypeError(f"State subspace must be Box, got {type(st_space)}")
+
+        # 최종 관측공간 정의
+        self.observation_space = DictSpace({
+            "image": img_space,
+            "state": Box(
+                low=st_space.low.astype(np.float32),
+                high=st_space.high.astype(np.float32),
+                shape=st_space.shape,
+                dtype=np.float32
+            ),
+        })
+
+    def observation(self, observation):
+        img = observation[self.image_key[0]][self.image_key[1]]
+        st  = observation[self.state_key].astype(np.float32)
+        return {"image": img, "state": st}
+
+
 
 class SafeActionWrapper(gym.ActionWrapper):
     def __init__(self, env, max_norm_scale: float = 1.0):
@@ -306,6 +356,8 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
         os.environ.setdefault("MUJOCO_GL", "egl")
         os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+        use_vision = True
+
         # ---- make envs
         env = gymnasium.make(env_id, render_mode="rgb_array")
         eval_env = gymnasium.make(env_id, render_mode="rgb_array")
@@ -313,9 +365,14 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
 
-        ob_key = "agent_pos" 
-        env = SelectObsKey(env, key=ob_key, last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
-        eval_env = SelectObsKey(eval_env, key=ob_key, last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
+        env = FlattenAlohaObs(env, image_key=("pixels","top"), state_key="agent_pos")
+        eval_env = FlattenAlohaObs(eval_env, image_key=("pixels","top"), state_key="agent_pos")
+
+        # Dict 지원 프레임스택 (키별 채널 축 스택)
+        if frame_stack is not None:
+            env = FrameStackWrapper(env, frame_stack)
+            eval_env = FrameStackWrapper(eval_env, frame_stack)
+
         env = SafeActionWrapper(env, max_norm_scale=1.0)
         eval_env = SafeActionWrapper(eval_env, max_norm_scale=1.0)
 
@@ -349,6 +406,7 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
             timeo = m.get("timeouts", np.zeros_like(terms, dtype=np.uint8)).astype(np.uint8)
             m["masks"] = (1 - np.clip(terms | timeo, 0, 1)).astype(np.float32)
             return m
+        # ---------------------------------------------------
         
         # ---- clip actions (dict)
         if action_clip_eps is not None:
@@ -361,6 +419,7 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
                 val_dataset = _clip_actions_any(val_dataset, action_clip_eps)
             already_clipped = True 
 
+        # 마스크 보장
         train_dataset = _ensure_masks_any(train_dataset)
         if val_dataset is not None:
             val_dataset = _ensure_masks_any(val_dataset)
@@ -397,8 +456,5 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
 
 
     return env, eval_env, train_dataset, val_dataset
-
-
-
 
 

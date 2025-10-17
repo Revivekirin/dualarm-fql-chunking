@@ -1,3 +1,4 @@
+
 import copy
 from typing import Any
 
@@ -11,6 +12,8 @@ from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
 
+
+from flax.core import FrozenDict
 
 class FQLAgent(flax.struct.PyTreeNode):
     """Flow Q-learning (FQL) agent."""
@@ -132,25 +135,86 @@ class FQLAgent(flax.struct.PyTreeNode):
 
         return self.replace(network=new_network, rng=new_rng), info
 
+    # @jax.jit
+    # def sample_actions(
+    #     self,
+    #     observations,
+    #     seed=None,
+    #     temperature=1.0,
+    # ):
+    #     """Sample actions from the one-step policy."""
+    #     action_seed, noise_seed = jax.random.split(seed)
+    #     noises = jax.random.normal(
+    #         action_seed,
+    #         (
+    #             *observations.shape[: -len(self.config['ob_dims'])],
+    #             self.config['action_dim'],
+    #         ),
+    #     )
+    #     actions = self.network.select('actor_onestep_flow')(observations, noises)
+    #     actions = jnp.clip(actions, -1, 1)
+    #     return actions
+
     @jax.jit
-    def sample_actions(
-        self,
-        observations,
-        seed=None,
-        temperature=1.0,
-    ):
-        """Sample actions from the one-step policy."""
-        action_seed, noise_seed = jax.random.split(seed)
-        noises = jax.random.normal(
-            action_seed,
-            (
-                *observations.shape[: -len(self.config['ob_dims'])],
-                self.config['action_dim'],
-            ),
-        )
-        actions = self.network.select('actor_onestep_flow')(observations, noises)
-        actions = jnp.clip(actions, -1, 1)
-        return actions
+    def sample_actions(self, observations, seed=None, temperature=1.0):
+        # 배치 차원 간결 추정: ndarray면 기존 ob_dims 규칙, dict/FrozenDict면 첫 leaf 기준
+        def _batch_shape(obs):
+            if hasattr(obs, "shape"):  # e.g. (B, H, W, C) or (H, W, C) or (B, D) or (D,)
+                return obs.shape[: -len(self.config['ob_dims'])] if len(self.config['ob_dims']) > 0 else obs.shape[:-1]
+            leaf = jax.tree_util.tree_leaves(obs)[0]  
+            return () if leaf.ndim in (1, 3) else (leaf.shape[0],)
+
+        bshape = _batch_shape(observations)
+        action_seed, _ = jax.random.split(seed)
+        noises = jax.random.normal(action_seed, bshape + (self.config['action_dim'],))
+
+        use_enc = self.config['encoder'] is not None
+        obs_in = self.network.select('actor_onestep_flow_encoder')(observations) if use_enc else observations
+        actions = self.network.select('actor_onestep_flow')(obs_in, noises, is_encoded=use_enc)
+        return jnp.clip(actions, -1, 1)
+
+    
+
+    # @jax.jit
+    # def sample_actions(
+    #     self,
+    #     observations,
+    #     seed=None,
+    #     temperature=1.0,
+    # ):
+    #     """Sample actions from the one-step policy."""
+
+    #     # 1) 배치 차원 안전 추정 유틸
+    #     def _infer_batch_shape(obs, ob_dims):
+    #         # obs가 ndarray류면 기존 로직 유지
+    #         if hasattr(obs, "shape"):
+    #             return obs.shape[: -len(ob_dims)] if len(ob_dims) > 0 else obs.shape[:-1]
+    #         # obs가 FrozenDict/dict/기타 PyTree면 첫 leaf 기준으로 배치 축만 사용
+    #         leaf = jax.tree_util.tree_leaves(obs)[0]
+    #         # 보통 leaf.shape = (B, ...) 이므로 B만 배치로 사용
+    #         return leaf.shape[:1]
+
+    #     batch_shape = _infer_batch_shape(observations, self.config['ob_dims'])
+    #     print("batch_shape:", batch_shape)
+
+    #     # 2) 노이즈 생성
+    #     action_seed, noise_seed = jax.random.split(seed)
+    #     noises = jax.random.normal(
+    #         action_seed,
+    #         (*batch_shape, self.config['action_dim']),
+    #     )
+
+    #     # 3) 액션 샘플링
+    #     print(self.config['encoder'])
+    #     if self.config['encoder'] is not None:
+    #         enc_obs = self.network.select('actor_onestep_flow_encoder')(observations)
+    #         actions = self.network.select('actor_onestep_flow')(enc_obs, noises)
+    #     else:
+    #         actions = self.network.select('actor_onestep_flow')(observations, noises)
+    #     actions = jnp.clip(actions, -1, 1)
+    #     return actions
+
+        
 
     @jax.jit
     def compute_flow_actions(
@@ -190,7 +254,10 @@ class FQLAgent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng, 2)
 
         ex_times = ex_actions[..., :1]
-        ob_dims = ex_observations.shape[1:]
+        if isinstance(ex_observations, (dict, FrozenDict)):
+            ob_dims = ()
+        else:
+            ob_dims = tuple(ex_observations.shape[1:])
         action_dim = ex_actions.shape[-1]
 
         # Define encoders.
@@ -230,6 +297,9 @@ class FQLAgent(flax.struct.PyTreeNode):
         if encoders.get('actor_bc_flow') is not None:
             # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
+        if encoders.get('actor_onestep_flow') is not None:
+            network_info['actor_onestep_flow_encoder'] = (encoders.get('actor_onestep_flow'), (ex_observations,))
+            
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -249,7 +319,7 @@ class FQLAgent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='fql',  # Agent name.
+            agent_name='fql2',  # Agent name.
             ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
             lr=3e-4,  # Learning rate.
@@ -264,7 +334,8 @@ def get_config():
             alpha=10.0,  # BC coefficient (need to be tuned for each environment).
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
-            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            # encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            encoder="impala"
         )
     )
     return config

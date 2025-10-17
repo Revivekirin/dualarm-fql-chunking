@@ -53,7 +53,6 @@ def _load_aloha_parquet_dataset(root_dir: str, val_ratio: float = 0.1):
 
     ds = pads.dataset(files, format="parquet")
     table = ds.to_table()
-    print(table)
 
     cols = {name.lower(): name for name in table.column_names}
     def has(*cands): return next((cols[c] for c in cands if c in cols), None)
@@ -235,7 +234,6 @@ def _load_aloha_scripted_dataset(
     N = len(actions)
     n_val = int(N * float(val_ratio))
     idx = np.arange(N)
-    # 재현성 위해 고정 시드 섞기
     rng = np.random.RandomState(42)
     rng.shuffle(idx)
     val_idx = idx[:n_val]
