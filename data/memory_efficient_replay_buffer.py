@@ -92,18 +92,30 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
             obs_pixels[pixel_key] = data_dict["observations"].pop(pixel_key)
             next_obs_pixels[pixel_key] = data_dict["next_observations"].pop(pixel_key)
 
-        if self._first:
-            for i in range(self._num_stack):
+        if self._num_stack == 1:
+            if self._first:
                 for pixel_key in self.pixel_keys:
-                    data_dict["observations"][pixel_key] = obs_pixels[pixel_key][i]
-
+                    data_dict["observations"][pixel_key] = obs_pixels[pixel_key]
                 self._is_correct_index[self._insert_index] = False
                 super().insert(data_dict)
 
-        for pixel_key in self.pixel_keys:
-            data_dict["observations"][pixel_key] = next_obs_pixels[pixel_key][-1]
+            for pixel_key in self.pixel_keys:
+                data_dict["observations"][pixel_key] = next_obs_pixels[pixel_key]
 
-        self._first = data_dict["dones"]
+        else:
+            # ★ 스택 있는 경우 기존 로직 유지 (여기서만 [i], [-1] 인덱싱)
+            if self._first:
+                for i in range(self._num_stack):
+                    for pixel_key in self.pixel_keys:
+                        data_dict["observations"][pixel_key] = obs_pixels[pixel_key][i]
+                    self._is_correct_index[self._insert_index] = False
+                    super().insert(data_dict)
+
+            for pixel_key in self.pixel_keys:
+                data_dict["observations"][pixel_key] = next_obs_pixels[pixel_key][-1]
+
+        d = data_dict["dones"]
+        self._first = bool(np.asarray(d).item()) if np.ndim(d) == 0 else bool(d[0])
 
         self._is_correct_index[self._insert_index] = True
         super().insert(data_dict)

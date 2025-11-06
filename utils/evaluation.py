@@ -33,7 +33,6 @@ def add_to(dict_of_lists, single_dict):
     for k, v in single_dict.items():
         dict_of_lists[k].append(v)
 
-
 def evaluate(
     agent,
     env,
@@ -74,6 +73,95 @@ def evaluate(
             action = actor_fn(observations=observation, temperature=eval_temperature)
             action = np.array(action)
             action = np.clip(action, -1, 1)
+
+            try:
+                next_observation, reward, terminated, truncated, info = env.step(action)
+            except Exception as e:
+                print("[EVAL] physics error -> early reset:", repr(e))
+                try:
+                    next_observation, info = env.reset()
+                except Exception as e2:
+                    print("[EVAL] reset failed:", repr(e2))
+                    break #end current traj.
+                terminated, truncated = True, True
+
+            done = terminated or truncated
+            step += 1
+
+            if should_render and (step % video_frame_skip == 0 or done):
+                frame = env.render().copy()
+                render.append(frame)
+
+            transition = dict(
+                observation=observation,
+                next_observation=next_observation,
+                action=action,
+                reward=reward,
+                done=done,
+                info=info,
+            )
+            add_to(traj, transition)
+            observation = next_observation
+        if i < num_eval_episodes:
+            add_to(stats, flatten(info))
+            trajs.append(traj)
+        else:
+            renders.append(np.array(render))
+
+    for k, v in stats.items():
+        stats[k] = np.mean(v)
+
+    return stats, trajs, renders
+
+def evaluate_chunked(
+    agent,
+    env,
+    config=None,
+    num_eval_episodes=50,
+    num_video_episodes=0,
+    video_frame_skip=3,
+    eval_temperature=0,
+):
+    """Evaluate the agent in the environment.
+
+    Args:
+        agent: Agent.
+        env: Environment.
+        config: Configuration dictionary.
+        num_eval_episodes: Number of episodes to evaluate the agent.
+        num_video_episodes: Number of episodes to render. These episodes are not included in the statistics.
+        video_frame_skip: Number of frames to skip between renders.
+        eval_temperature: Action sampling temperature.
+
+    Returns:
+        A tuple containing the statistics, trajectories, and rendered videos.
+    """
+    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    trajs = []
+    stats = defaultdict(list)
+
+    renders = []
+    for i in trange(num_eval_episodes + num_video_episodes):
+        traj = defaultdict(list)
+        should_render = i >= num_eval_episodes
+
+        observation, info = env.reset()
+        done = False
+        step = 0
+        render = []
+        while not done:
+            action = actor_fn(observations=observation, temperature=eval_temperature)
+            action = np.array(action)
+            action = np.clip(action, -1, 1)
+            if action.ndim == 2:
+                action = action[0]
+
+
+            if config['chunk_len'] >0:
+                H  = int(config['chunk_len'])
+                Da = int(config['action_dim_single'])
+                action = action.reshape(H, Da)  
+                action = action[0].astype(np.float32)
 
             try:
                 next_observation, reward, terminated, truncated, info = env.step(action)

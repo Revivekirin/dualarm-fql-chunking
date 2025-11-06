@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fql
-#SBATCH --nodelist=pat-t3
+#SBATCH --nodelist=pat-t5
 #SBATCH --output=log_rl_%j.out
 #SBATCH --error=log_rl_%j.err
 #SBATCH --gres=gpu:1
@@ -16,10 +16,14 @@ export MUJOCO_GL=egl
 export EGL_DEVICE_ID=0        
 export GYM_DISABLE_PLUGIN_ENTRYPOINTS=1 
 
-python run_teacher_sampling.py   \
- --env_name=scene-play-singletask-v0   \
- --online_steps=1000000  \
- --offline_steps=300000 \
+# initial running
+python main_chunked.py   \
+ --env_name=gym-aloha   \
+ --online_steps=3000000  \
+ --offline_steps=0 \
  --video_episodes=5  \
- --agent=agents/fql.py \
+ --agent=agents/fql_chunked.py \
  --save_interval=50000 \
+ --aloha_task=sim_transfer \
+ --restore_path=/home/sophia435256/workspace2/git/dualarm-fql-chunking/exp/fql/Debug/sd000_s_26096.0.20251105_192316 \
+ --restore_epoch=400000

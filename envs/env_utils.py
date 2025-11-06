@@ -25,35 +25,72 @@ from gymnasium.spaces import Box
 import numpy as np
 import gymnasium as gym
 
-class SafeActionWrapper(gym.ActionWrapper):
-    def __init__(self, env, max_norm_scale: float = 1.0):
+# envs/env_utils.py
+
+import numpy as np
+import gymnasium as gym
+from dm_control.rl import control as dm_control_control
+
+class SafeActionWrapper(gym.Wrapper):
+    """정책 출력을 안전하게 다듬어서 dm_control로 전달.
+    - [-1, 1] 클립
+    - (joint-delta/torque 등의) 스케일 다운
+    - 지수 스무딩(저역통과)
+    - 한 번의 step을 여러 미니스텝으로 쪼개서 천천히 적용
+    """
+    def __init__(self, env, max_abs=0.2, smoothing=0.8, micro_steps=4):
         super().__init__(env)
-        self.max_norm_scale = float(max_norm_scale)
+        self.max_abs = float(max_abs)          # 최종 크기 제한 (원본 [-1,1] 대비 축소)
+        self.smoothing = float(smoothing)      # 0.0(없음) ~ 0.95(강한 스무딩) 권장
+        self.micro_steps = int(micro_steps)    # 1 이상
+        self._prev = None
 
-    def action(self, action):
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._prev = np.zeros(self.action_space.shape, dtype=np.float32)
+        return obs, info
+
+    def step(self, action):
+        # 1) NaN/Inf 방지 + [-1,1] 클립
         a = np.asarray(action, dtype=np.float32)
-        # 1) NaN/Inf 방지
         a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+        a = np.clip(a, -1.0, 1.0)
 
-        # 2) 박스 범위로 클립
-        if hasattr(self.action_space, "low"):
-            low, high = self.action_space.low, self.action_space.high
-            a = np.clip(a, low, high)
+        # 2) 축소 스케일링
+        a = a * self.max_abs
 
-        # 3) soft clip (과도한 노름 완화)
-        if self.max_norm_scale is not None:
-            # 액션 범위의 평균 크기 추정
-            if hasattr(self.action_space, "high"):
-                ref = np.mean(np.abs(self.action_space.high))
-                ref = 1.0 if ref == 0 else ref
-            else:
-                ref = 1.0
-            max_norm = self.max_norm_scale * ref * a.size**0.5
-            nrm = np.linalg.norm(a)
-            if nrm > max_norm and nrm > 0:
-                a = a * (max_norm / nrm)
+        # 3) 스무딩
+        if self._prev is None:
+            self._prev = np.zeros_like(a)
+        a_target = self.smoothing * self._prev + (1.0 - self.smoothing) * a
 
-        return a
+        # 4) 마이크로 스텝으로 나눠 적용 (선형 보간)
+        obs = reward = terminated = truncated = info = None
+        r_sum = 0.0
+        term_any = False
+        trunc_any = False
+        for k in range(self.micro_steps):
+            a_interp = self._prev + (a_target - self._prev) * (k + 1) / self.micro_steps
+            try:
+                obs, r, term, trunc, info = self.env.step(a_interp)
+            except dm_control_control.PhysicsError:
+                # 물리 발산 시 즉시 종료 + 패널티
+                r = -1.0
+                term = True
+                trunc = True
+                info = dict(crash=True)
+                # 안전 리셋을 위해 prev를 0으로
+                self._prev = np.zeros_like(a_interp)
+                return obs, r, term, trunc, info
+
+            r_sum += float(r)
+            term_any = term_any or bool(term)
+            trunc_any = trunc_any or bool(trunc)
+            if term_any or trunc_any:
+                break
+
+        self._prev = a_target
+        return obs, r_sum, term_any, trunc_any, info
 
 
 class SelectObsKey(gym.ObservationWrapper):
@@ -316,8 +353,8 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, aloh
         ob_key = "agent_pos" 
         env = SelectObsKey(env, key=ob_key, last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
         eval_env = SelectObsKey(eval_env, key=ob_key, last_frame_only=True, num_stack=frame_stack, target_feat_dim=14)
-        env = SafeActionWrapper(env, max_norm_scale=1.0)
-        eval_env = SafeActionWrapper(eval_env, max_norm_scale=1.0)
+        env = SafeActionWrapper(env, max_abs=0.15, smoothing=0.85, micro_steps=5)
+        eval_env = SafeActionWrapper(eval_env, max_abs=0.15, smoothing=0.85, micro_steps=5)
 
         # ---- load parquet (dict)
         train_dataset, val_dataset = _load_aloha_parquet_dataset(dataset_root, val_ratio=val_ratio)

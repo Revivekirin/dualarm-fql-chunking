@@ -3,7 +3,7 @@ from typing import Any, Optional, Sequence
 import distrax
 import flax.linen as nn
 import jax.numpy as jnp
-
+from flax.core import FrozenDict
 
 def default_init(scale=1.0):
     """Default kernel initializer."""
@@ -149,6 +149,39 @@ class Actor(nn.Module):
         return distribution
 
 
+
+def _squeeze_like_actions(x: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+    """obs/feat 텐서의 time dim(-2)이 길이 1이고 actions보다 차원이 1 크면 squeeze."""
+    if x.ndim == actions.ndim + 1 and x.shape[-2] == 1:
+        return jnp.squeeze(x, axis=-2)
+    return x
+
+def eliminate_time_dim(actions, observations):
+    """
+    observations가 ndarray 또는 (Frozen)Dict인 경우 모두 처리.
+    squeeze 결과를 **반환**합니다.
+    """
+    if isinstance(observations, (dict, FrozenDict)):
+        return {k: _squeeze_like_actions(v, actions) for k, v in observations.items()}
+    else:
+        return _squeeze_like_actions(observations, actions)
+
+def flatten_observations(observations):
+    """
+    (Frozen)Dict -> 벡터. 우선순위 키가 있으면 그것만 사용하고,
+    아니면 값들을 마지막 축 기준으로 concat.
+    """
+    if isinstance(observations, (dict, FrozenDict)):
+        if 'state' in observations:
+            return observations['state']
+        if 'proprio' in observations:
+            return observations['proprio']
+        parts = []
+        for v in observations.values():
+            parts.append(v.reshape(v.shape[0], -1))
+        return jnp.concatenate(parts, axis=-1)
+    return observations
+
 class Value(nn.Module):
     """Value/critic network.
 
@@ -166,6 +199,7 @@ class Value(nn.Module):
     num_ensembles: int = 2
     encoder: nn.Module = None
 
+
     def setup(self):
         mlp_class = MLP
         if self.num_ensembles > 1:
@@ -175,22 +209,18 @@ class Value(nn.Module):
         self.value_net = value_net
 
     def __call__(self, observations, actions=None):
-        """Return values or critic values.
-
-        Args:
-            observations: Observations.
-            actions: Actions (optional).
-        """
         if self.encoder is not None:
-            inputs = [self.encoder(observations)]
+            obs_feat = self.encoder(observations)
+            obs_feat = eliminate_time_dim(actions, obs_feat)
         else:
-            inputs = [observations]
+            observations = eliminate_time_dim(actions, observations) 
+            obs_feat = flatten_observations(observations)        
+
+        inputs = [obs_feat]
         if actions is not None:
             inputs.append(actions)
         inputs = jnp.concatenate(inputs, axis=-1)
-
         v = self.value_net(inputs).squeeze(-1)
-
         return v
 
 
@@ -211,30 +241,26 @@ class ActorVectorField(nn.Module):
 
     def setup(self) -> None:
         self.mlp = MLP((*self.hidden_dims, self.action_dim), activate_final=False, layer_norm=self.layer_norm)
-
+    
     @nn.compact
     def __call__(self, observations, actions, times=None, is_encoded=False):
-        """Return the vectors at the given states, actions, and times (optional).
-
-        Args:
-            observations: Observations.
-            actions: Actions.
-            times: Times (optional).
-            is_encoded: Whether the observations are already encoded.
-        """
         if not is_encoded and self.encoder is not None:
             observations = self.encoder(observations)
+        observations = eliminate_time_dim(actions, observations)
+        observations = flatten_observations(observations)
+
+        if times is not None:
+            if times.ndim == 1: #(B,)
+                times = times[:, None]          
+            elif times.ndim == 3 and times.shape[-2] == 1: #(B, 1)
+                times = jnp.squeeze(times, axis=-2)  
+            elif times.ndim > 2: #scalar
+                times = times.reshape(times.shape[0], -1) 
+                if times.shape[-1] != 1:
+                    times = times[:, :1]
+
         if times is None:
-            print("observations shape:", observations)
-            print("actions shape:", actions)
-            if observations.ndim == actions.ndim + 1 and observations.shape[-2] == 1:
-                observations = jnp.squeeze(observations, axis=-2)
             inputs = jnp.concatenate([observations, actions], axis=-1)
         else:
-            if observations.ndim == actions.ndim + 1 and observations.shape[-2] == 1:
-                observations = jnp.squeeze(observations, axis=-2)
             inputs = jnp.concatenate([observations, actions, times], axis=-1)
-
-        v = self.mlp(inputs)
-
-        return v
+        return self.mlp(inputs)

@@ -57,11 +57,10 @@ def _load_aloha_parquet_dataset(root_dir: str, val_ratio: float = 0.1):
     cols = {name.lower(): name for name in table.column_names}
     def has(*cands): return next((cols[c] for c in cands if c in cols), None)
 
-    # ★ 현재 스키마에 맞춘 매핑
     obs_col  = has("observation.state", "observations", "obs", "state", "states")
     act_col  = has("action", "actions")
     done_col = has("next.done", "dones", "done", "terminals", "terminal")
-    rew_col  = has("rewards", "reward")  # 없으면 0
+    rew_col  = has("rewards", "reward")  
     ep_col   = has("episode_index", "episode", "episode_id", "traj_id")
     step_col = has("frame_index", "t", "step", "time", "timestamp")
 

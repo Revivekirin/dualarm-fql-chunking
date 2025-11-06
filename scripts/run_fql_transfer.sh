@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=fql
-#SBATCH --nodelist=pat-t7
+#SBATCH --nodelist=pat-t4
 #SBATCH --output=log_rl_%j.out
 #SBATCH --error=log_rl_%j.err
 #SBATCH --gres=gpu:1
-#SBATCH --mem-per-gpu=80G
+#SBATCH --mem-per-gpu=120G
 #SBATCH --cpus-per-gpu=8
 #SBATCH --time=24:00:00
 
 conda init
 conda activate fql
-cd ~/workspace2/dualarm-fql-chunking
+cd ~/workspace2/git/dualarm-fql-chunking
 
 export MUJOCO_GL=egl
 export EGL_DEVICE_ID=0        
@@ -23,5 +23,5 @@ python main.py   \
  --offline_steps=300000 \
  --video_episodes=5  \
  --agent=agents/fql.py \
- --save_interval=100000 \
+ --save_interval=50000 \
  --aloha_task=sim_transfer \
